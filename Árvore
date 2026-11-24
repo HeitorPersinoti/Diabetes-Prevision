@@ -1,0 +1,324 @@
+# PACOTES
+library(readxl)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(shiny)
+library(patchwork)
+
+# 2. BASE DE DADOS
+Dados <- read_excel("C:/Users/heito_r2qskpg/Documents/HFP/Diabetes_2021_Klaus_Oficial.xls")
+
+# 3. LIMPEZA
+dados <- Dados %>%
+  dplyr::select(-Comprimido, -Insulina, -Cigarro_dia...11, -Cigarro_dia...12, -cidade)
+
+dados <- dados %>%
+  mutate(Amputados = if_else(is.na(IMC), 1, 2)) %>%
+  rename(IMC_novo = IMC_Amputado) %>%
+  dplyr::select(-IMC)
+
+if("Bebida_Alcool" %in% names(dados)) {
+  dados <- dados %>%
+    filter(Bebida_Alcool != 888) %>%
+    mutate(`Frequencia Alcool` = case_when(
+      Bebida_Alcool == 3 ~ 0,
+      Bebida_Alcool == 2 ~ 7,
+      TRUE ~ `Frequencia Alcool`
+    ))
+}
+
+dados <- dados %>%
+  mutate(Frequencia_EF = case_when(
+    `Exercício Físico` == 2 ~ 0,
+    TRUE ~ Frequencia_EF
+  )) %>%
+  filter(!is.na(Frequencia_EF))
+
+dados <- dados %>%
+  mutate(Estado_Saude = case_when(
+    Estado_Saude == 777 ~ 0,
+    Estado_Saude == 888 ~ 0,
+    TRUE ~ as.numeric(Estado_Saude)
+  )) %>%
+  mutate(Pressão_Alta = case_when(
+    Pressão_Alta == 777 ~ 0,
+    TRUE ~ Pressão_Alta
+  )) %>%
+  mutate(Classificação = case_when(
+    IMC_novo < 18.00 ~ 1,
+    IMC_novo >= 18.00 & IMC_novo < 25.00 ~ 2,
+    IMC_novo >= 25.00 & IMC_novo < 30.00 ~ 3,
+    IMC_novo >= 30.00 & IMC_novo < 35.00 ~ 4,
+    IMC_novo >= 35.00 & IMC_novo < 40.00 ~ 5,
+    IMC_novo >= 40.00 ~ 6,
+    TRUE ~ 0
+  )) %>%
+  filter(Diabetes != 777)
+
+# 4. ALGORITMO CART
+gini <- function(y) {
+  p <- table(y)/length(y)
+  g <- 1 - sum(p^2)
+  return(g)
+}
+
+classe_majoritaria <- function(y) {
+  tab <- table(y)
+  classe <- names(tab)[which.max(tab)]
+  return(classe)
+}
+
+melhor_divisao <- function(dados, xvars, yvar) {
+  melhor_var   <- NULL
+  melhor_corte <- NULL
+  melhor_ganho <- -1
+  
+  y <- dados[[yvar]]
+  gini_pai <- gini(y)
+  n_total  <- length(y)
+  
+  for(v in xvars) {
+    valores <- sort(unique(dados[[v]]))
+    if(length(valores) <= 1) next
+    
+    cortes <- (valores[-1] + valores[-length(valores)]) / 2
+    
+    for(c in cortes) {
+      esq_idx <- dados[[v]] <= c
+      dir_idx <- dados[[v]] > c
+      
+      y_esq <- y[esq_idx]
+      y_dir <- y[dir_idx]
+      
+      if(length(y_esq) == 0 || length(y_dir) == 0) next
+      
+      gini_filhos <- (length(y_esq)/n_total)*gini(y_esq) + (length(y_dir)/n_total)*gini(y_dir)
+      ganho       <- gini_pai - gini_filhos
+      
+      if(ganho > melhor_ganho) {
+        melhor_ganho <- ganho
+        melhor_var   <- v
+        melhor_corte <- c
+      }
+    }
+  }
+  return(list(var = melhor_var, corte = melhor_corte, ganho = melhor_ganho))
+}
+
+cart_fit <- function(dados, xvars, yvar, prof = 0, prof_max = 3, min_n = 30) {
+  y   <- dados[[yvar]]
+  no  <- list(tipo = NULL,
+              classe = classe_majoritaria(y),
+              gini = gini(y),
+              n = length(y),        
+              dist = table(y))
+  
+  parar <- (length(unique(y)) == 1 || prof >= prof_max || nrow(dados) < min_n)
+  
+  if(parar) {
+    no$tipo <- "folha"
+    return(no)
+  }
+  
+  div <- melhor_divisao(dados = dados, xvars = xvars, yvar = yvar)
+  
+  if(is.null(div$var) || div$ganho <= 0) {
+    no$tipo <- "folha"
+    return(no)
+  }
+  
+  esq_idx <- dados[[div$var]] <= div$corte
+  dir_idx <- dados[[div$var]] > div$corte 
+  
+  no$tipo   <- "no"
+  no$var    <- div$var
+  no$corte  <- div$corte
+  no$ganho  <- div$ganho
+  
+  no$esq    <- cart_fit(dados = dados[esq_idx, ],
+                        xvars = xvars,
+                        yvar = yvar,
+                        prof = prof + 1,
+                        prof_max = prof_max,
+                        min_n = min_n)
+  no$dir    <- cart_fit(dados = dados[dir_idx, ],
+                        xvars = xvars,
+                        yvar = yvar,
+                        prof = prof + 1,
+                        prof_max = prof_max,
+                        min_n = min_n)
+  return(no)
+}
+
+pred_um <- function(arv, obs) {
+  if(arv$tipo == "folha") return(arv$classe)
+  if(obs[[arv$var]] <= arv$corte) {  
+    return(pred_um(arv$esq, obs))   
+  } else {
+    return(pred_um(arv$dir, obs))   
+  }
+}
+
+cart_pred <- function(arv, novos_dados) {
+  preds <- character(nrow(novos_dados))
+  for(i in 1:nrow(novos_dados)) {
+    preds[i] <- pred_um(arv, novos_dados[i, , drop = FALSE])
+  }
+  return(preds)
+}
+
+# Probabilidade das folhas
+pred_prob_um <- function(arv, obs) {
+  if(arv$tipo == "folha") {
+    if(sum(arv$dist) == 0) return(NULL)
+    return(arv$dist / arv$n)
+  }
+  if(obs[[arv$var]] <= arv$corte) {  
+    return(pred_prob_um(arv$esq, obs))   
+  } else {
+    return(pred_prob_um(arv$dir, obs))   
+  }
+}
+
+cart_predict_proba <- function(arv, novos_dados) {
+  resultados <- list()
+  for(i in 1:nrow(novos_dados)) {
+    prob_folha <- pred_prob_um(arv, novos_dados[i, , drop = FALSE])
+    resultados[[i]] <- prob_folha
+  }
+  return(resultados)
+}
+
+# 5. TREINAMENTO, TESTE E AVALIAÇÃO
+yvar  <- "Diabetes"
+xvars <- setdiff(names(dados), c(yvar, "ID", "ano"))
+
+set.seed(1212)
+idx    <- sample(x = 1:nrow(dados), size = floor(0.7 * nrow(dados)))
+treino <- dados[idx, ]
+teste  <- dados[-idx, ]
+
+# Treina o modelo principal com a base de treino
+modelo_arvore_cart <- cart_fit(dados = treino, xvars = xvars, yvar = yvar, prof_max = 4, min_n = 40)
+
+predicoes_teste <- cart_pred(modelo_arvore_cart, teste)
+matriz_confusao <- table(Real = teste[[yvar]], Predito = predicoes_teste)
+print(matriz_confusao)
+
+if (all(dim(matriz_confusao) == 2)) {
+  classes_reais    <- rownames(matriz_confusao)
+  classes_preditas <- colnames(matriz_confusao)
+  
+  classe_negativa  <- classes_reais[1]
+  classe_positiva  <- classes_reais[2]
+  
+  acuracia         <- sum(diag(matriz_confusao)) / sum(matriz_confusao)
+  sensibilidade    <- matriz_confusao[classe_positiva, classe_positiva] / sum(matriz_confusao[classe_positiva, ])
+  especificidade   <- matriz_confusao[classe_negativa, classe_negativa] / sum(matriz_confusao[classe_negativa, ])
+  precisao         <- matriz_confusao[classe_positiva, classe_positiva] / sum(matriz_confusao[, classe_positiva])
+  f1_score         <- 2 * (precisao * sensibilidade) / (precisao + sensibilidade)
+  
+  cat("Acurácia (Taxa Global de Acerto): ", round(acuracia * 100, 2), "%\n", sep = "")
+  cat("Sensibilidade (Detectar Diabetes): ", round(sensibilidade * 100, 2), "%\n", sep="")
+  cat("Especificidade (Detectar Saudáveis): ", round(especificidade * 100, 2), "%\n", sep="")
+  cat("Precisão (Confiança do diagnóstico): ", round(precisao * 100, 2), "%\n", sep="")
+  cat("F1-Score (Equilíbrio do modelo): ", round(f1_score * 100, 2), "%\n", sep="")
+}
+
+# 6. APLICATIVO SHINY
+ui <- fluidPage(
+  titlePanel("Calculadora de Risco de Diabetes (Árvore CART)"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("Insira os Dados do Indivíduo:"),
+      numericInput("Idade", "Idade:", value = 45, min = 18, max = 100),
+      numericInput("Peso", "Peso (kg):", value = 75, min = 30, max = 200),
+      numericInput("Altura", "Altura (m):", value = 1.70, min = 1.0, max = 2.3, step = 0.01),
+      selectInput("Pressao_Alta", "Possui Pressão Alta? (1: Sim, 0: Não)", choices = c("Não" = 0, "Sim" = 1)),
+      selectInput("Frequencia_EF", "Frequência de Exercício Físico (0 a 4):", choices = c("0: Não pratico" = 0, "1: 1 a 2x" = 1, "2: 3 a 4x" = 2, "3: 5 a 6x" = 3, "4: Todos os dias" = 4)),
+      selectInput("Estado_Saude", "Estado de Saúde Geral (1 a 5):", choices = c("1: Muito bom" = 1, "2: Bom" = 2, "3: Regular" = 3, "4: Ruim" = 4, "5: Muito ruim" = 5)),
+      
+      actionButton("btn_calcular", "Calcular Probabilidade", class = "btn-primary", style = "width: 100%; margin-top: 15px;")
+    ),
+    
+    mainPanel(
+      h3("Resultado da Avaliação"),
+      hr(),
+      verbatimTextOutput("resultado_predicao"),
+      plotOutput("grafico_probabilidade", height = "250px")
+    )
+  )
+)
+
+server <- function(input, output) {
+  
+  observeEvent(input$btn_calcular, {
+    imc_calc <- input$Peso / (input$Altura ^ 2)
+    
+    classif_imc <- case_when(
+      imc_calc < 18.00 ~ 1,
+      imc_calc >= 18.00 & imc_calc < 25.00 ~ 2,
+      imc_calc >= 25.00 & imc_calc < 30.00 ~ 3,
+      imc_calc >= 30.00 & imc_calc < 35.00 ~ 4,
+      imc_calc >= 35.00 & imc_calc < 40.00 ~ 5,
+      imc_calc >= 40.00 ~ 6,
+      TRUE ~ 0
+    )
+    
+    novo_indiv <- dados[1, xvars, drop = FALSE]
+    
+    if("Idade" %in% xvars) novo_indiv$Idade <- input$Idade
+    if("Peso" %in% xvars) novo_indiv$Peso <- input$Peso
+    if("Altura" %in% xvars) novo_indiv$Altura <- input$Altura
+    if("Pressão_Alta" %in% xvars) novo_indiv$Pressão_Alta <- as.numeric(input$Pressao_Alta)
+    if("Frequencia_EF" %in% xvars) novo_indiv$Frequencia_EF <- as.numeric(input$Frequencia_EF)
+    if("Estado_Saude" %in% xvars) novo_indiv$Estado_Saude <- as.numeric(input$Estado_Saude)
+    if("IMC_novo" %in% xvars) novo_indiv$IMC_novo <- imc_calc
+    if("Classificação" %in% xvars) novo_indiv$Classificação <- classif_imc
+    
+    res_prob <- cart_predict_proba(modelo_arvore_cart, novo_indiv)[[1]]
+    
+    prob_sim_decimal <- ifelse("1" %in% names(res_prob), res_prob[["1"]], 0)
+    prob_sim_porcento <- round(prob_sim_decimal * 100, 2)
+    limiar_perigo <- 25.0
+    
+    output$resultado_predicao <- renderText({
+      if(is.null(res_prob)) {
+        return("Não foi possível calcular a probabilidade para este perfil.")
+      }
+      
+      texto <- paste0("Probabilidade estimada de possuir diabetes: ", prob_sim_porcento, "%\n\n")
+      
+      if(prob_sim_porcento > limiar_perigo) {
+        texto <- paste0(texto, "⚠️ ATENÇÃO: A probabilidade está acima de 25%. Representa sinal de alerta e recomenda-se buscar ajuda médica para uma avaliação detalhada!")
+      } else {
+        texto <- paste0(texto, "✅ A probabilidade está abaixo do limite de alerta de 25%. Continue mantendo hábitos saudáveis!")
+      }
+      
+      return(texto)
+    })
+    
+    output$grafico_probabilidade <- renderPlot({
+      req(res_prob)
+      df_plot <- data.frame(
+        Classe = ifelse(names(res_prob) == "1", "Sim", "Não"),
+        Probabilidade = as.numeric(res_prob) * 100
+      )
+      
+      ggplot(df_plot, aes(x = Classe, y = Probabilidade, fill = Classe)) +
+        geom_col(width = 0.5, alpha = 0.8) +
+        geom_hline(yintercept = limiar_perigo, color = "red", linetype = "dashed", linewidth = 1) +
+        annotate("text", x = 1.5, y = limiar_perigo + 3, label = "Limite de Alerta (25%)", color = "red", fontface = "bold") +
+        geom_text(aes(label = paste0(round(Probabilidade, 1), "%")), vjust = -0.5, fontface = "bold") +
+        ylim(0, 105) +
+        labs(title = "Risco Avaliado vs. Limiar de Alerta", x = "Diabetes", y = "Probabilidade (%)") +
+        theme_minimal() +
+        theme(legend.position = "none")
+    })
+  })
+}
+
+# 7. APLICATIVO
+shinyApp(ui = ui, server = server)
